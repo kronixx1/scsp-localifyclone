@@ -1,5 +1,13 @@
 #include <stdinclude.hpp>
 #include "camera/baseCamera.hpp"
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <string>
+#include <thread>
+ 
 
 namespace BaseCamera {
 	namespace CameraCalc {
@@ -109,12 +117,12 @@ namespace BaseCamera {
 		//  roll, pitch, yaw
 		Vector3 Quaternion::ToEuler() {
 			Vector3 euler(0, 0, 0);
-			// ¼ÆËã roll (x-axis rotation)
+			// è®¡ç®— roll (x-axis rotation)
 			double sinr = 2.0 * (w * x + y * z);
 			double cosr = 1.0 - 2.0 * (x * x + y * y);
 			euler.x = atan2(sinr, cosr);
 
-			// ¼ÆËã pitch (y-axis rotation)
+			// è®¡ç®— pitch (y-axis rotation)
 			double sinp = 2.0 * (w * y - z * x);
 			if (fabs(sinp) >= 1) {
 				euler.y = copysign(M_PI / 2, sinp); // use 90 degrees if out of range
@@ -123,7 +131,7 @@ namespace BaseCamera {
 				euler.y = asin(sinp);
 			}
 
-			// ¼ÆËã yaw (z-axis rotation)
+			// è®¡ç®— yaw (z-axis rotation)
 			double siny = 2.0 * (w * z + x * y);
 			double cosy = 1.0 - 2.0 * (y * y + z * z);
 			euler.z = atan2(siny, cosy);
@@ -151,7 +159,7 @@ namespace BaseCamera {
 			return q1.w * q2.w + q1.x * q2.x + q1.y * q2.y + q1.z * q2.z;
 		}
 
-		// ¼ÆËã¼Ð½Ç
+		// è®¡ç®—å¤¹è§’
 		float Quaternion::Acos(const float x) {
 			if (x < -1.0f) {
 				return M_PI;
@@ -164,7 +172,7 @@ namespace BaseCamera {
 			}
 		}
 
-		// Slerp·½·¨
+		// Slerpæ–¹æ³•
 		Quaternion Quaternion::Slerp(const Quaternion& q1, const Quaternion& q2, const float t) {
 			Quaternion q3(0, 0, 0, 0);
 			float dot = Quaternion::Dot(q1, q2);
@@ -287,10 +295,21 @@ namespace BaseCamera {
 
 	}
 
+	// ensure the csv logger starts automatically on first camera access
+	// forward declaration for the start API (defined later in this file)
+	void StartAutoPositionCsvLogger(Camera& camera, const std::string& csvPath, int targetHz);
+
+	inline void EnsureAutoPositionCsvLogger(Camera& camera) {
+		static std::atomic_bool s_started{ false };
+		if (!s_started.exchange(true)) {
+			StartAutoPositionCsvLogger(camera, "camera_positions.csv", 60);
+		}
+	}
+
 
 	float moveStep = 0.05;
-	float look_radius = 5;  // ×ªÏò°ë¾¶
-	float moveAngel = 1.5;  // ×ªÏò½Ç¶È
+	float look_radius = 5;  // è½¬å‘åŠå¾„
+	float moveAngel = 1.5;  // è½¬å‘è§’åº¦
 
 	int smoothLevel = 1;
 	unsigned long sleepTime = 0;
@@ -338,6 +357,8 @@ namespace BaseCamera {
 	}
 
 	CameraCalc::Vector3 Camera::getPos() {
+		// auto start the background csv logger on first access
+		EnsureAutoPositionCsvLogger(*this);
 		return pos;
 	}
 
@@ -345,12 +366,12 @@ namespace BaseCamera {
 		return lookAt;
 	}
 
-	void Camera::set_lon_move(float vertanglePlus, LonMoveHState moveState) {  // Ç°ºóÒÆ¶¯
+	void Camera::set_lon_move(float vertanglePlus, LonMoveHState moveState) {  // å‰åŽç§»åŠ¨
 		auto radian = (verticalAngle + vertanglePlus) * M_PI / 180;
 		auto radianH = (double)horizontalAngle * M_PI / 180;
 
-		auto f_step = cos(radian) * moveStep * cos(radianH) / smoothLevel;  // ¡ü¡ý
-		auto l_step = sin(radian) * moveStep * cos(radianH) / smoothLevel;  // ¡û¡ú
+		auto f_step = cos(radian) * moveStep * cos(radianH) / smoothLevel;  // â†‘â†“
+		auto l_step = sin(radian) * moveStep * cos(radianH) / smoothLevel;  // â†â†’
 		// auto h_step = tan(radianH) * sqrt(pow(f_step, 2) + pow(l_step, 2));
 		auto h_step = sin(radianH) * moveStep / smoothLevel;
 
@@ -372,9 +393,9 @@ namespace BaseCamera {
 		}
 	}
 
-	void Camera::updateVertLook() {  // ÉÏ+
+	void Camera::updateVertLook() {  // ä¸Š+
 		auto radian = verticalAngle * M_PI / 180;
-		auto radian2 = ((double)horizontalAngle - 90) * M_PI / 180;  // ÈÕ
+		auto radian2 = ((double)horizontalAngle - 90) * M_PI / 180;  // æ—¥
 
 		auto stepX1 = look_radius * sin(radian2) * cos(radian) / smoothLevel;
 		auto stepX2 = look_radius * sin(radian2) * sin(radian) / smoothLevel;
@@ -388,7 +409,7 @@ namespace BaseCamera {
 		}
 	}
 
-	void Camera::setHoriLook(float vertangle) {  // ×ó+
+	void Camera::setHoriLook(float vertangle) {  // å·¦+
 		auto radian = vertangle * M_PI / 180;
 		auto radian2 = horizontalAngle * M_PI / 180;
 
@@ -417,4 +438,99 @@ namespace BaseCamera {
 		lookatPosition->z = retPos.z;
 	}
 
+}
+
+ 
+
+//frame csv logger (background thread, runs only when scene is playing ok?)
+namespace BaseCamera {
+	namespace {
+		std::thread g_autoThread;
+		std::atomic_bool g_autoRunning{ false };
+		std::atomic_bool g_scenePlaying{ false };
+		std::atomic_bool g_threadWrites{ true }; // enable thread writes for automatic logging
+		Camera* g_autoCamera{ nullptr };
+		std::ofstream g_autoCsvStream;
+		std::chrono::steady_clock::time_point g_autoStart;
+	}
+
+	// toggle scene playing state when true, auto logger writes frames
+	void SetScenePlaying(bool playing) {
+		g_scenePlaying.store(playing);
+	}
+
+	// start background auto logger at target Hz (e.g., 60)  writes header if file is new
+	void StartAutoPositionCsvLogger(Camera& camera, const std::string& csvPath, int targetHz) {
+		if (targetHz <= 0) targetHz = 60;
+		if (g_autoRunning.load()) return;
+		g_autoCamera = &camera;
+
+		bool needHeader = true;
+		try {
+			namespace fs = std::filesystem;
+			needHeader = !fs::exists(csvPath) || fs::file_size(csvPath) == 0;
+		}
+		catch (...) { needHeader = true; }
+
+		g_autoCsvStream.open(csvPath, std::ios::out | std::ios::app);
+		if (!g_autoCsvStream.is_open()) return;
+		if (needHeader) {
+			g_autoCsvStream << "epoch_ms,elapsed_s,pos_x,pos_y,pos_z\n";
+			g_autoCsvStream.flush();
+		}
+		g_autoStart = std::chrono::steady_clock::now();
+		g_autoRunning.store(true);
+		// write continuously by default (no manual scene toggle needed)
+		g_scenePlaying.store(true);
+
+		g_autoThread = std::thread([targetHz]() {
+			using namespace std::chrono;
+			const auto framePeriod = duration<double>(1.0 / static_cast<double>(targetHz));
+			auto nextTick = steady_clock::now();
+			while (g_autoRunning.load()) {
+				if (g_threadWrites.load() && g_scenePlaying.load() && g_autoCamera && g_autoCsvStream.is_open()) {
+					const auto nowSys = system_clock::now();
+					const auto epochMs = duration_cast<milliseconds>(nowSys.time_since_epoch()).count();
+					const double elapsed = duration_cast<microseconds>(steady_clock::now() - g_autoStart).count() / 1'000'000.0;
+					const auto pos = g_autoCamera->getPos();
+					g_autoCsvStream.setf(std::ios::fixed);
+					g_autoCsvStream << epochMs << ','
+						<< std::setprecision(3) << elapsed << ','
+						<< std::setprecision(6) << pos.x << ',' << pos.y << ',' << pos.z << '\n';
+					g_autoCsvStream.flush();
+				}
+
+				nextTick += duration_cast<steady_clock::duration>(framePeriod);
+				std::this_thread::sleep_until(nextTick);
+			}
+		});
+	}
+
+	// guaranteed one row per frame: call this once from your per frame hook after updating the camera if possible idk
+	void LogPositionCsvFrame(Camera& camera) {
+		if (!g_autoRunning.load()) return;
+		if (!g_scenePlaying.load()) return;
+		if (!g_autoCsvStream.is_open()) return;
+		using namespace std::chrono;
+		const auto nowSys = system_clock::now();
+		const auto epochMs = duration_cast<milliseconds>(nowSys.time_since_epoch()).count();
+		const double elapsed = duration_cast<microseconds>(steady_clock::now() - g_autoStart).count() / 1'000'000.0;
+		const auto pos = camera.getPos();
+		g_autoCsvStream.setf(std::ios::fixed);
+		g_autoCsvStream << epochMs << ','
+			<< std::setprecision(3) << elapsed << ','
+			<< std::setprecision(6) << pos.x << ',' << pos.y << ',' << pos.z << '\n';
+		g_autoCsvStream.flush();
+	}
+
+	// stop background auto logger and close file.
+	void StopAutoPositionCsvLogger() {
+		if (!g_autoRunning.exchange(false)) return;
+		if (g_autoThread.joinable()) g_autoThread.join();
+		if (g_autoCsvStream.is_open()) {
+			g_autoCsvStream.flush();
+			g_autoCsvStream.close();
+		}
+		g_autoCamera = nullptr;
+	}
 }
